@@ -26,6 +26,9 @@ class YKHybridI2IOSSNode:
             optional_inputs[f"image_{group_letter}_a"] = ("IMAGE", {})
             optional_inputs[f"image_{group_letter}_b"] = ("IMAGE", {})
             optional_inputs[f"image_{group_letter}_c"] = ("IMAGE", {})
+            optional_inputs[f"image_url_{group_letter}_a"] = ("STRING", {"forceInput": True, "placeholder": "参考图URL（优先使用，跳过上传）"})
+            optional_inputs[f"image_url_{group_letter}_b"] = ("STRING", {"forceInput": True, "placeholder": "参考图URL（优先使用，跳过上传）"})
+            optional_inputs[f"image_url_{group_letter}_c"] = ("STRING", {"forceInput": True, "placeholder": "参考图URL（优先使用，跳过上传）"})
             optional_inputs[f"prompt_{i+1}"] = ("STRING", {"forceInput": True})
             optional_inputs[f"batch_count_{i+1}"] = ("INT", {
                 "default": 1,
@@ -363,26 +366,35 @@ class YKHybridI2IOSSNode:
         print(f"❌ [组 {group_id} 变体 {var_id}] 所有 {total_attempt} 次尝试均失败", flush=True)
         return None
 
-    def process_single_group_with_batch(self, group_id, image_tensors, prompt_list, batch_count,
+    def process_single_group_with_batch(self, group_id, image_tensors, direct_image_urls, prompt_list, batch_count,
                                        runninghub_api_key, banana_api_key,
                                        image_hosting, creds,
                                        resolution, aspect_ratio, max_wait_time,
                                        strategy):
         image_urls = []
-        hosting_name = "ImgBB" if image_hosting == "ImgBB" else "阿里云 OSS"
-        print(f"[组 {group_id}] 正在上传 {len(image_tensors)} 张参考图到 {hosting_name}...", flush=True)
-        for idx, tensor in enumerate(image_tensors[:5], 1):
-            try:
-                pil_img = self.tensor_to_pil(tensor)
-                url = self.upload_image(pil_img, image_hosting, **creds)
-                image_urls.append(url)
-                print(f"[组 {group_id}] 参考图 {idx} 上传成功: {url}", flush=True)
-            except Exception as e:
-                print(f"[组 {group_id}] 跳过无效图像 {idx}: {e}", flush=True)
-                continue
+        
+        # 优先使用直接传入的 URL（跳过上传）
+        for url in direct_image_urls:
+            if isinstance(url, str) and url.strip():
+                image_urls.append(url.strip())
+                print(f"[组 {group_id}] 使用直接传入的参考图 URL: {url.strip()}", flush=True)
+        
+        # URL 不足时，上传本地图片补充
+        if len(image_urls) < 5 and image_tensors:
+            hosting_name = "ImgBB" if image_hosting == "ImgBB" else "阿里云 OSS"
+            print(f"[组 {group_id}] 正在上传 {len(image_tensors)} 张参考图到 {hosting_name}...", flush=True)
+            for idx, tensor in enumerate(image_tensors[:5-len(image_urls)], 1):
+                try:
+                    pil_img = self.tensor_to_pil(tensor)
+                    url = self.upload_image(pil_img, image_hosting, **creds)
+                    image_urls.append(url)
+                    print(f"[组 {group_id}] 参考图 {idx} 上传成功: {url}", flush=True)
+                except Exception as e:
+                    print(f"[组 {group_id}] 跳过无效图像 {idx}: {e}", flush=True)
+                    continue
 
         if not image_urls:
-            raise RuntimeError(f"[组 {group_id}] 无有效参考图可上传")
+            raise RuntimeError(f"[组 {group_id}] 无有效参考图（既没有传入 URL，也没有本地图片可上传）")
 
         print(f"[组 {group_id}] 参考图全部上传完成，开始生成 {batch_count} 个变体", flush=True)
 
@@ -510,15 +522,20 @@ class YKHybridI2IOSSNode:
 
             # ✅ 关键修改：不再拼接 tensor，而是收集原始 tensor 列表
             image_tensors = []
+            direct_image_urls = []
             group_letter = chr(ord('A') + i - 1)
             for suffix in ['a', 'b', 'c']:
+                # 收集本地图片（tensor）
                 img = kwargs.get(f"image_{group_letter}_{suffix}")
                 if img is not None and img.shape[0] > 0:
-                    # 支持 batch 输入（如 LoadImage 输出可能是 [N,H,W,C]）
                     for b in range(img.shape[0]):
                         image_tensors.append(img[b:b+1])  # 保持 [1,H,W,C] 格式
+                # 收集直接传入的 URL
+                url = kwargs.get(f"image_url_{group_letter}_{suffix}", "")
+                if isinstance(url, str) and url.strip():
+                    direct_image_urls.append(url.strip())
 
-            if not image_tensors:
+            if not image_tensors and not direct_image_urls:
                 continue
 
             # ✅ 根据实际 prompt_lines 决定 batch_count
@@ -528,7 +545,7 @@ class YKHybridI2IOSSNode:
                 user_batch = int(kwargs.get(f"batch_count_{i}", 1))
                 effective_batch_count = max(1, min(10, user_batch))
 
-            valid_tasks.append((i - 1, i, image_tensors, prompt_lines, effective_batch_count))
+            valid_tasks.append((i - 1, i, image_tensors, direct_image_urls, prompt_lines, effective_batch_count))
 
         if not valid_tasks:
             raise ValueError("至少需要一组有效的（提示词 + 至少1张参考图）")
@@ -538,10 +555,10 @@ class YKHybridI2IOSSNode:
 
         with ThreadPoolExecutor(max_workers=len(valid_tasks)) as executor:
             futures = {}
-            for out_idx, group_id, image_tensors, prompt_lines, batch_count in valid_tasks:
+            for out_idx, group_id, image_tensors, direct_image_urls, prompt_lines, batch_count in valid_tasks:
                 future = executor.submit(
                     self.process_single_group_with_batch,
-                    group_id, image_tensors, prompt_lines, batch_count,
+                    group_id, image_tensors, direct_image_urls, prompt_lines, batch_count,
                     runninghub_api_key, 全能Xinbao_api_key,
                     image_hosting, creds,
                     resolution, aspect_ratio, max_wait_time,
