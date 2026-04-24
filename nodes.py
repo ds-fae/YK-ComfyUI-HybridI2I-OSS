@@ -100,8 +100,8 @@ class YKHybridI2IOSSNode:
             "optional": optional_inputs
         }
 
-    RETURN_TYPES = ("IMAGE",) * 10 + ("IMAGE",) + ("STRING",)
-    RETURN_NAMES = tuple(f"输出_{i}" for i in range(1, 11)) + ("所有成功图像", "上传图片URLs")
+    RETURN_TYPES = ("IMAGE",) * 10 + ("IMAGE",) + ("STRING",) + ("STRING",)
+    RETURN_NAMES = tuple(f"输出_{i}" for i in range(1, 11)) + ("所有成功图像", "参考图URLs", "结果图URLs")
     FUNCTION = "generate"
     CATEGORY = "YK-ComfyUI"
 
@@ -386,7 +386,8 @@ class YKHybridI2IOSSNode:
 
         print(f"[组 {group_id}] 参考图全部上传完成，开始生成 {batch_count} 个变体", flush=True)
 
-        successful_results = []
+        successful_tensors = []
+        successful_pils = []
         with ThreadPoolExecutor(max_workers=batch_count) as executor:
             futures = [
                 executor.submit(
@@ -403,21 +404,33 @@ class YKHybridI2IOSSNode:
                 try:
                     result = future.result()
                     if result is not None:
-                        successful_results.append(self.pil_to_tensor(result))
+                        successful_pils.append(result)
+                        successful_tensors.append(self.pil_to_tensor(result))
                 except Exception as e:
                     print(f"⚠️ [组 {group_id}] 某变体执行异常（已跳过）: {e}", flush=True)
 
-        if not successful_results:
+        if not successful_tensors:
             print(f"[组 {group_id}] 所有变体均失败", flush=True)
-            return torch.zeros((1, 64, 64, 3), dtype=torch.float32), image_urls
+            return torch.zeros((1, 64, 64, 3), dtype=torch.float32), [], image_urls
+
+        # 上传结果图到图床
+        result_image_urls = []
+        for idx, pil_img in enumerate(successful_pils, 1):
+            try:
+                url = self.upload_image(pil_img, image_hosting, **creds)
+                result_image_urls.append(url)
+                print(f"[组 {group_id}] 结果图 {idx} 上传成功: {url}", flush=True)
+            except Exception as e:
+                print(f"[组 {group_id}] 结果图 {idx} 上传失败: {e}", flush=True)
+                continue
 
         # 统一尺寸以避免拼接失败（仅针对输出图）
         try:
-            first_tensor = successful_results[0]
+            first_tensor = successful_tensors[0]
             _, H, W, C = first_tensor.shape
             aligned_tensors = [first_tensor]
-            for i in range(1, len(successful_results)):
-                t = successful_results[i]
+            for i in range(1, len(successful_tensors)):
+                t = successful_tensors[i]
                 if t.shape[1:] != (H, W, C):
                     pil_img = self.tensor_to_pil(t)
                     resized_pil = pil_img.resize((W, H), Image.LANCZOS)
@@ -425,10 +438,10 @@ class YKHybridI2IOSSNode:
                 aligned_tensors.append(t)
             final_output = torch.cat(aligned_tensors, dim=0)
             print(f"[组 {group_id}] 成功生成并合并 {len(aligned_tensors)} / {batch_count} 个变体", flush=True)
-            return final_output, image_urls
+            return final_output, result_image_urls, image_urls
         except Exception as e:
             print(f"❌ [组 {group_id}] 合并成功图像时出错，返回单张: {e}", flush=True)
-            return successful_results[0], image_urls
+            return successful_tensors[0], result_image_urls, image_urls
 
     def generate(self,
                  社区版_最大尝试次数,
@@ -537,12 +550,14 @@ class YKHybridI2IOSSNode:
                 futures[future] = out_idx
 
             url_results = {}
+            result_url_results = {}
             for future in as_completed(futures):
                 out_idx = futures[future]
                 try:
-                    img_tensor, urls = future.result()
+                    img_tensor, result_urls, ref_urls = future.result()
                     results[out_idx] = img_tensor
-                    url_results[out_idx] = urls
+                    url_results[out_idx] = ref_urls
+                    result_url_results[out_idx] = result_urls
                 except Exception as e:
                     print(f"⚠️ 组 {out_idx + 1} 整体失败: {e}", flush=True)
 
@@ -557,7 +572,7 @@ class YKHybridI2IOSSNode:
         else:
             all_success_output = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
 
-        # 汇总所有上传URL
+        # 汇总所有参考图URL
         url_lines = []
         for i in range(10):
             if i in url_results and url_results[i]:
@@ -568,7 +583,18 @@ class YKHybridI2IOSSNode:
                 url_lines.append(f"组{i+1}: (无)")
         all_urls_str = "\n".join(url_lines)
 
-        return tuple(results) + (all_success_output, all_urls_str)
+        # 汇总所有结果图URL
+        result_url_lines = []
+        for i in range(10):
+            if i in result_url_results and result_url_results[i]:
+                group_id = i + 1
+                urls = result_url_results[i]
+                result_url_lines.append(f"组{group_id}: " + ", ".join(urls))
+            else:
+                result_url_lines.append(f"组{i+1}: (无)")
+        all_result_urls_str = "\n".join(result_url_lines)
+
+        return tuple(results) + (all_success_output, all_urls_str, all_result_urls_str)
 
 
 NODE_CLASS_MAPPINGS = {
