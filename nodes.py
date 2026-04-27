@@ -62,8 +62,7 @@ class YKHybridI2IOSSNode:
                 "runninghub_api_key": ("STRING", {"default": "", "placeholder": "RunningHub API 密钥"}),
                 "全能Xinbao_api_key": ("STRING", {"default": "", "placeholder": "全能Xinbao API 密钥"}),
 
-                "upload_mode": (["阿里云AK", "预签名URL"], {"default": "阿里云AK"}),
-                "show_preview_image": (["否", "是"], {"default": "否"}),
+                "运行模式": (["预签名URL(正式)", "阿里云AK(测试+预览)"], {"default": "预签名URL(正式)"}),
                 "oss_access_key_id": ("STRING", {"default": "", "placeholder": "阿里云 AccessKey ID"}),
                 "oss_access_key_secret": ("STRING", {"default": "", "placeholder": "阿里云 AccessKey Secret"}),
                 "oss_bucket_name": ("STRING", {"default": "", "placeholder": "OSS Bucket 名称"}),
@@ -393,12 +392,20 @@ class YKHybridI2IOSSNode:
                  全能Xinbao_最大尝试次数,
                  官方PRO版_最大尝试次数,
                  runninghub_api_key, 全能Xinbao_api_key,
-                 upload_mode, show_preview_image,
+                 运行模式,
                  oss_access_key_id, oss_access_key_secret, oss_bucket_name, oss_endpoint,
                  output_format,
                  resolution, aspect_ratio, seed, global_concurrent_tasks, max_wait_time,
                  max_prompt_lines_global,
                  **kwargs):
+
+        # 从运行模式推导上传方式和预览开关
+        if 运行模式 == "预签名URL(正式)":
+            upload_mode = "预签名URL"
+            show_preview_image = "否"
+        else:
+            upload_mode = "阿里云AK"
+            show_preview_image = "是"
 
         strategy = self._build_strategy_from_attempts(
             int(社区版_最大尝试次数),
