@@ -64,6 +64,9 @@ class YKHybridI2IOSSNode:
                 "oss_access_key_secret": ("STRING", {"default": "", "placeholder": "阿里云 AccessKey Secret"}),
                 "oss_bucket_name": ("STRING", {"default": "", "placeholder": "OSS Bucket 名称"}),
                 "oss_endpoint": ("STRING", {"default": "oss-cn-beijing.aliyuncs.com", "placeholder": "OSS Endpoint"}),
+                "oss_save_path": ("STRING", {"default": "yyyy-mm-dd/comfyui_rhart", "placeholder": "OSS保存路径，如 2026-04-24/comfyui_rhart"}),
+                "oss_file_name": ("STRING", {"default": "result", "placeholder": "文件名前缀，如 xxx"}),
+                "output_format": (["jpg", "png"], {"default": "jpg"}),
                 "resolution": (["1K", "2K", "4K", "8K"], {"default": "1K"}),
                 "aspect_ratio": (["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "16:9", "9:16", "21:9", "自动"], {"default": "自动"}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
@@ -97,26 +100,41 @@ class YKHybridI2IOSSNode:
     FUNCTION = "generate"
     CATEGORY = "YK-ComfyUI"
 
-    def upload_to_aliyun_oss(self, pil_img, access_key_id, access_key_secret, bucket_name, endpoint):
+    def upload_to_aliyun_oss(self, pil_img, access_key_id, access_key_secret, bucket_name, endpoint,
+                              oss_save_path, oss_file_name, output_format, group_id, var_id):
         if not OSS_AVAILABLE:
             raise RuntimeError("未安装 oss2 库，请运行: pip install oss2")
         if not all([access_key_id.strip(), access_key_secret.strip(), bucket_name.strip()]):
             raise ValueError("请填写完整的阿里云 OSS 配置信息")
 
-        date_str = time.strftime("%Y-%m-%d", time.localtime())
-        timestamp = str(int(time.time() * 1000))
-        random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
-        object_key = f"{date_str}/comfyui_rhart/{timestamp}_{random_suffix}.png"
+        # 处理保存路径末尾的 /
+        save_path = oss_save_path.strip()
+        if save_path and not save_path.endswith('/'):
+            save_path += '/'
+
+        # 构建文件名: xxx_{group_id}_{var_id}.{format}
+        ext = output_format.lower()
+        if ext not in ('jpg', 'jpeg', 'png'):
+            ext = 'jpg'
+        object_key = f"{save_path}{oss_file_name.strip()}_{group_id}_{var_id}.{ext}"
 
         auth = oss2.Auth(access_key_id.strip(), access_key_secret.strip())
         bucket = oss2.Bucket(auth, f'https://{endpoint.strip()}', bucket_name.strip())
 
         buf = BytesIO()
-        pil_img.save(buf, format="PNG")
+        if ext in ('jpg', 'jpeg'):
+            # JPG 需要 RGB 模式
+            if pil_img.mode in ('RGBA', 'P'):
+                pil_img = pil_img.convert('RGB')
+            pil_img.save(buf, format="JPEG", quality=95)
+            content_type = 'image/jpeg'
+        else:
+            pil_img.save(buf, format="PNG")
+            content_type = 'image/png'
         buf.seek(0)
 
         try:
-            bucket.put_object(object_key, buf.getvalue(), headers={'Content-Type': 'image/png'})
+            bucket.put_object(object_key, buf.getvalue(), headers={'Content-Type': content_type})
         except Exception as e:
             raise RuntimeError(f"阿里云 OSS 上传失败: {e}")
 
@@ -311,6 +329,7 @@ class YKHybridI2IOSSNode:
                                        runninghub_api_key, banana_api_key,
                                        oss_access_key_id, oss_access_key_secret,
                                        oss_bucket_name, oss_endpoint,
+                                       oss_save_path, oss_file_name, output_format,
                                        resolution, aspect_ratio, max_wait_time,
                                        strategy):
         if not image_urls:
@@ -320,8 +339,9 @@ class YKHybridI2IOSSNode:
 
         result_urls = []
         with ThreadPoolExecutor(max_workers=batch_count) as executor:
-            futures = [
-                executor.submit(
+            futures = {}
+            for var_index in range(batch_count):
+                future = executor.submit(
                     self._attempt_with_strategy,
                     group_id, var_index + 1, image_urls,
                     prompt_list[min(var_index, len(prompt_list) - 1)],
@@ -329,20 +349,23 @@ class YKHybridI2IOSSNode:
                     resolution, aspect_ratio, max_wait_time,
                     strategy
                 )
-                for var_index in range(batch_count)
-            ]
+                futures[future] = var_index + 1
+
             for future in futures:
+                var_id = futures[future]
                 try:
                     pil_img = future.result()
                     if pil_img is not None:
                         url = self.upload_to_aliyun_oss(
                             pil_img, oss_access_key_id, oss_access_key_secret,
-                            oss_bucket_name, oss_endpoint
+                            oss_bucket_name, oss_endpoint,
+                            oss_save_path, oss_file_name, output_format,
+                            group_id, var_id
                         )
                         result_urls.append(url)
-                        print(f"[组 {group_id}] 结果图上传成功: {url}", flush=True)
+                        print(f"[组 {group_id} 变体 {var_id}] 结果图上传成功: {url}", flush=True)
                 except Exception as e:
-                    print(f"⚠️ [组 {group_id}] 某变体执行或上传异常（已跳过）: {e}", flush=True)
+                    print(f"⚠️ [组 {group_id} 变体 {var_id}] 执行或上传异常（已跳过）: {e}", flush=True)
 
         return result_urls
 
@@ -352,6 +375,7 @@ class YKHybridI2IOSSNode:
                  官方PRO版_最大尝试次数,
                  runninghub_api_key, 全能Xinbao_api_key,
                  oss_access_key_id, oss_access_key_secret, oss_bucket_name, oss_endpoint,
+                 oss_save_path, oss_file_name, output_format,
                  resolution, aspect_ratio, seed, global_concurrent_tasks, max_wait_time,
                  max_prompt_lines_global,
                  **kwargs):
@@ -426,6 +450,7 @@ class YKHybridI2IOSSNode:
                     group_id, image_urls, prompt_lines, batch_count,
                     runninghub_api_key, 全能Xinbao_api_key,
                     oss_access_key_id, oss_access_key_secret, oss_bucket_name, oss_endpoint,
+                    oss_save_path, oss_file_name, output_format,
                     resolution, aspect_ratio, max_wait_time,
                     strategy
                 )
