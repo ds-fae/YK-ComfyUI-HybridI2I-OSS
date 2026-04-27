@@ -2,6 +2,7 @@ import os
 import requests
 import time
 import random
+import numpy as np
 from PIL import Image
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +25,7 @@ class YKHybridI2IOSSNode:
             optional_inputs[f"image_url_{group_letter}_a"] = ("STRING", {"forceInput": True, "placeholder": "参考图URL"})
             optional_inputs[f"image_url_{group_letter}_b"] = ("STRING", {"forceInput": True, "placeholder": "参考图URL"})
             optional_inputs[f"image_url_{group_letter}_c"] = ("STRING", {"forceInput": True, "placeholder": "参考图URL"})
+            optional_inputs[f"presigned_url_{group_letter}"] = ("STRING", {"forceInput": True, "placeholder": "预签名URL（该组结果图上传地址）"})
             optional_inputs[f"prompt_{i+1}"] = ("STRING", {"forceInput": True})
             optional_inputs[f"batch_count_{i+1}"] = ("INT", {
                 "default": 1,
@@ -60,12 +62,12 @@ class YKHybridI2IOSSNode:
                 "runninghub_api_key": ("STRING", {"default": "", "placeholder": "RunningHub API 密钥"}),
                 "全能Xinbao_api_key": ("STRING", {"default": "", "placeholder": "全能Xinbao API 密钥"}),
 
+                "upload_mode": (["阿里云AK", "预签名URL"], {"default": "阿里云AK"}),
+                "show_preview_image": (["否", "是"], {"default": "否"}),
                 "oss_access_key_id": ("STRING", {"default": "", "placeholder": "阿里云 AccessKey ID"}),
                 "oss_access_key_secret": ("STRING", {"default": "", "placeholder": "阿里云 AccessKey Secret"}),
                 "oss_bucket_name": ("STRING", {"default": "", "placeholder": "OSS Bucket 名称"}),
                 "oss_endpoint": ("STRING", {"default": "oss-cn-beijing.aliyuncs.com", "placeholder": "OSS Endpoint"}),
-                "oss_save_path": ("STRING", {"default": "yyyy-mm-dd/comfyui_rhart", "placeholder": "OSS保存路径，如 2026-04-24/comfyui_rhart"}),
-                "oss_file_name": ("STRING", {"default": "result", "placeholder": "文件名前缀，如 xxx"}),
                 "output_format": (["jpg", "png"], {"default": "jpg"}),
                 "resolution": (["1K", "2K", "4K", "8K"], {"default": "1K"}),
                 "aspect_ratio": (["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "16:9", "9:16", "21:9", "自动"], {"default": "自动"}),
@@ -95,35 +97,28 @@ class YKHybridI2IOSSNode:
             "optional": optional_inputs
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("结果图URLs",)
+    RETURN_TYPES = ("STRING", "IMAGE")
+    RETURN_NAMES = ("结果图URLs", "测试图像")
     FUNCTION = "generate"
     CATEGORY = "YK-ComfyUI"
 
-    def upload_to_aliyun_oss(self, pil_img, access_key_id, access_key_secret, bucket_name, endpoint,
-                              oss_save_path, oss_file_name, output_format, group_id, var_id):
+    def upload_to_aliyun_oss(self, pil_img, access_key_id, access_key_secret, bucket_name, endpoint, output_format):
         if not OSS_AVAILABLE:
             raise RuntimeError("未安装 oss2 库，请运行: pip install oss2")
         if not all([access_key_id.strip(), access_key_secret.strip(), bucket_name.strip()]):
             raise ValueError("请填写完整的阿里云 OSS 配置信息")
 
-        # 处理保存路径末尾的 /
-        save_path = oss_save_path.strip()
-        if save_path and not save_path.endswith('/'):
-            save_path += '/'
-
-        # 构建文件名: xxx_{group_id}_{var_id}.{format}
-        ext = output_format.lower()
-        if ext not in ('jpg', 'jpeg', 'png'):
-            ext = 'jpg'
-        object_key = f"{save_path}{oss_file_name.strip()}_{group_id}_{var_id}.{ext}"
+        date_str = time.strftime("%Y-%m-%d", time.localtime())
+        timestamp = str(int(time.time() * 1000))
+        random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
+        ext = 'jpg' if output_format.lower() in ('jpg', 'jpeg') else 'png'
+        object_key = f"{date_str}/comfyui_rhart/{timestamp}_{random_suffix}.{ext}"
 
         auth = oss2.Auth(access_key_id.strip(), access_key_secret.strip())
         bucket = oss2.Bucket(auth, f'https://{endpoint.strip()}', bucket_name.strip())
 
         buf = BytesIO()
         if ext in ('jpg', 'jpeg'):
-            # JPG 需要 RGB 模式
             if pil_img.mode in ('RGBA', 'P'):
                 pil_img = pil_img.convert('RGB')
             pil_img.save(buf, format="JPEG", quality=95)
@@ -139,6 +134,26 @@ class YKHybridI2IOSSNode:
             raise RuntimeError(f"阿里云 OSS 上传失败: {e}")
 
         return f"https://{bucket_name.strip()}.{endpoint.strip()}/{object_key}"
+
+    def upload_via_presigned_url(self, pil_img, presigned_url, output_format):
+        ext = output_format.lower()
+        if ext not in ('jpg', 'jpeg', 'png'):
+            ext = 'jpg'
+
+        buf = BytesIO()
+        if ext in ('jpg', 'jpeg'):
+            if pil_img.mode in ('RGBA', 'P'):
+                pil_img = pil_img.convert('RGB')
+            pil_img.save(buf, format="JPEG", quality=95)
+            content_type = 'image/jpeg'
+        else:
+            pil_img.save(buf, format="PNG")
+            content_type = 'image/png'
+        buf.seek(0)
+
+        resp = requests.put(presigned_url, data=buf.getvalue(), headers={'Content-Type': content_type}, timeout=60)
+        resp.raise_for_status()
+        return presigned_url
 
     # ====== 全能Xinbao 图像生成 ======
     def process_single_variation_banana(self, group_id, var_id, image_urls, prompt, seed,
@@ -329,15 +344,16 @@ class YKHybridI2IOSSNode:
                                        runninghub_api_key, banana_api_key,
                                        oss_access_key_id, oss_access_key_secret,
                                        oss_bucket_name, oss_endpoint,
-                                       oss_save_path, oss_file_name, output_format,
+                                       upload_mode, presigned_url, output_format,
                                        resolution, aspect_ratio, max_wait_time,
-                                       strategy):
+                                       strategy, show_preview_image):
         if not image_urls:
             raise RuntimeError(f"[组 {group_id}] 无有效参考图 URL")
 
         print(f"[组 {group_id}] 使用 {len(image_urls)} 个参考图 URL，开始生成 {batch_count} 个变体", flush=True)
 
         result_urls = []
+        preview_pil = None
         with ThreadPoolExecutor(max_workers=batch_count) as executor:
             futures = {}
             for var_index in range(batch_count):
@@ -356,26 +372,30 @@ class YKHybridI2IOSSNode:
                 try:
                     pil_img = future.result()
                     if pil_img is not None:
-                        url = self.upload_to_aliyun_oss(
-                            pil_img, oss_access_key_id, oss_access_key_secret,
-                            oss_bucket_name, oss_endpoint,
-                            oss_save_path, oss_file_name, output_format,
-                            group_id, var_id
-                        )
+                        if upload_mode == "预签名URL":
+                            url = self.upload_via_presigned_url(pil_img, presigned_url, output_format)
+                        else:
+                            url = self.upload_to_aliyun_oss(
+                                pil_img, oss_access_key_id, oss_access_key_secret,
+                                oss_bucket_name, oss_endpoint, output_format
+                            )
                         result_urls.append(url)
                         print(f"[组 {group_id} 变体 {var_id}] 结果图上传成功: {url}", flush=True)
+                        if show_preview_image == "是" and preview_pil is None:
+                            preview_pil = pil_img
                 except Exception as e:
                     print(f"⚠️ [组 {group_id} 变体 {var_id}] 执行或上传异常（已跳过）: {e}", flush=True)
 
-        return result_urls
+        return result_urls, preview_pil
 
     def generate(self,
                  社区版_最大尝试次数,
                  全能Xinbao_最大尝试次数,
                  官方PRO版_最大尝试次数,
                  runninghub_api_key, 全能Xinbao_api_key,
+                 upload_mode, show_preview_image,
                  oss_access_key_id, oss_access_key_secret, oss_bucket_name, oss_endpoint,
-                 oss_save_path, oss_file_name, output_format,
+                 output_format,
                  resolution, aspect_ratio, seed, global_concurrent_tasks, max_wait_time,
                  max_prompt_lines_global,
                  **kwargs):
@@ -394,14 +414,15 @@ class YKHybridI2IOSSNode:
         if need_xinbao and not 全能Xinbao_api_key.strip():
             raise ValueError("当前策略包含「全能Xinbao」，请填写其 API 密钥")
 
-        if not OSS_AVAILABLE:
-            raise ValueError("请安装 oss2: pip install oss2")
-        if not all([oss_access_key_id.strip(), oss_access_key_secret.strip(), oss_bucket_name.strip()]):
-            raise ValueError("请填写完整的阿里云 OSS 配置")
+        if upload_mode == "阿里云AK":
+            if not OSS_AVAILABLE:
+                raise ValueError("阿里云AK模式需要 oss2，请运行: pip install oss2")
+            if not all([oss_access_key_id.strip(), oss_access_key_secret.strip(), oss_bucket_name.strip()]):
+                raise ValueError("阿里云AK模式需要完整的OSS配置")
 
         global_concurrent_tasks = min(max(1, int(global_concurrent_tasks)), 10)
         max_wait_time = min(max(30, int(max_wait_time)), 600)
-        
+
         max_prompt_lines_global = int(max_prompt_lines_global)
         if max_prompt_lines_global == 0:
             max_prompt_lines_global = -1
@@ -427,13 +448,22 @@ class YKHybridI2IOSSNode:
             if not image_urls:
                 continue
 
+            presigned_url = ""
+            if upload_mode == "预签名URL":
+                presigned_url = kwargs.get(f"presigned_url_{group_letter}", "")
+                if isinstance(presigned_url, str):
+                    presigned_url = presigned_url.strip()
+                if not presigned_url:
+                    print(f"⚠️ [组 {i}] 预签名URL模式但缺少 presigned_url_{group_letter}，已跳过", flush=True)
+                    continue
+
             if len(prompt_lines) > 1:
                 effective_batch_count = len(prompt_lines)
             else:
                 user_batch = int(kwargs.get(f"batch_count_{i}", 1))
                 effective_batch_count = max(1, min(10, user_batch))
 
-            valid_tasks.append((i, image_urls, prompt_lines, effective_batch_count))
+            valid_tasks.append((i, image_urls, prompt_lines, effective_batch_count, presigned_url))
 
         if not valid_tasks:
             raise ValueError("至少需要一组有效的（提示词 + 至少1个参考图URL）")
@@ -442,34 +472,46 @@ class YKHybridI2IOSSNode:
         print(f"▶ 仅处理前 {len(valid_tasks)} 个有效组（受 global_concurrent_tasks={global_concurrent_tasks} 限制）", flush=True)
 
         result_url_lines = []
+        all_preview_pils = []
         with ThreadPoolExecutor(max_workers=len(valid_tasks)) as executor:
             futures = {}
-            for group_id, image_urls, prompt_lines, batch_count in valid_tasks:
+            for group_id, image_urls, prompt_lines, batch_count, presigned_url in valid_tasks:
                 future = executor.submit(
                     self.process_single_group_with_batch,
                     group_id, image_urls, prompt_lines, batch_count,
                     runninghub_api_key, 全能Xinbao_api_key,
                     oss_access_key_id, oss_access_key_secret, oss_bucket_name, oss_endpoint,
-                    oss_save_path, oss_file_name, output_format,
+                    upload_mode, presigned_url, output_format,
                     resolution, aspect_ratio, max_wait_time,
-                    strategy
+                    strategy, show_preview_image
                 )
                 futures[future] = group_id
 
             for future in as_completed(futures):
                 group_id = futures[future]
                 try:
-                    result_urls = future.result()
+                    result_urls, preview_pil = future.result()
                     if result_urls:
                         result_url_lines.append(f"组{group_id}: " + ", ".join(result_urls))
                     else:
                         result_url_lines.append(f"组{group_id}: (无)")
+                    if preview_pil is not None:
+                        all_preview_pils.append(preview_pil)
                 except Exception as e:
                     print(f"⚠️ 组 {group_id} 整体失败: {e}", flush=True)
                     result_url_lines.append(f"组{group_id}: (失败)")
 
         result_url_lines.sort(key=lambda x: int(x.split(':')[0].replace('组', '')))
-        return ("\n".join(result_url_lines),)
+
+        # 构建测试图像输出
+        if show_preview_image == "是" and all_preview_pils:
+            preview_pil = all_preview_pils[0].convert("RGB")
+            img_array = np.array(preview_pil).astype(np.float32) / 255.0
+            preview_tensor = img_array.reshape(1, img_array.shape[0], img_array.shape[1], img_array.shape[2])
+        else:
+            preview_tensor = np.zeros((1, 64, 64, 3), dtype=np.float32)
+
+        return ("\n".join(result_url_lines), preview_tensor)
 
 
 NODE_CLASS_MAPPINGS = {

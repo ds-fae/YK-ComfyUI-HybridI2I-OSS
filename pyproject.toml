@@ -1,7 +1,7 @@
 [project]
 name = "YK-ComfyUI-HybridI2I-OSS"
 description = "批量多API图生图节点，支持社区版/全能Xinbao/官方PRO混合策略，支持OSS图床与上传URL输出"
-version = "3.1.0"
+version = "3.2.0"
 license = {text = "MIT"}
 dependencies = ["oss2", "requests", "Pillow", "numpy", "torch"]
 
