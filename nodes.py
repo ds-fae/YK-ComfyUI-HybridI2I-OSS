@@ -96,8 +96,8 @@ class YKHybridI2IOSSNode:
             "optional": optional_inputs
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE")
-    RETURN_NAMES = ("结果图URLs", "测试图像")
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("测试图像",)
     FUNCTION = "generate"
     CATEGORY = "YK-ComfyUI"
 
@@ -509,6 +509,8 @@ class YKHybridI2IOSSNode:
                     result_url_lines.append(f"组{group_id}: (失败)")
 
         result_url_lines.sort(key=lambda x: int(x.split(':')[0].replace('组', '')))
+        if result_url_lines:
+            print("\n".join(result_url_lines), flush=True)
 
         # 构建测试图像输出
         if show_preview_image == "是" and all_preview_pils:
@@ -518,7 +520,7 @@ class YKHybridI2IOSSNode:
         else:
             preview_tensor = np.zeros((1, 64, 64, 3), dtype=np.float32)
 
-        return ("\n".join(result_url_lines), preview_tensor)
+        return (preview_tensor,)
 
 
 NODE_CLASS_MAPPINGS = {
