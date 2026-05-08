@@ -144,6 +144,12 @@ class YKHybridI2IOSSNode:
         if not all([access_key_id.strip(), access_key_secret.strip(), bucket_name.strip(), endpoint.strip()]):
             raise ValueError("请填写完整的阿里云 OSS 配置信息（含Endpoint）")
 
+        # 自动补全 endpoint 域名
+        endpoint = endpoint.strip()
+        if '.aliyuncs.com' not in endpoint:
+            endpoint = f"{endpoint}.aliyuncs.com"
+            print(f"[OSS] endpoint 已自动补全为: {endpoint}", flush=True)
+
         date_str = time.strftime("%Y-%m-%d", time.localtime())
         timestamp = str(int(time.time() * 1000))
         random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
@@ -590,14 +596,16 @@ class YKHybridI2IOSSNode:
                 all_paths.extend(path_results[i])
 
         # 全部完成后统一回调 POST
-        if callback_url and callback_url.strip():
+        if callback_url and callback_url.strip() and all_paths:
             payload = {"paths": all_paths}
             try:
                 resp = requests.post(callback_url.strip(), json=payload, timeout=30)
                 resp.raise_for_status()
-                print(f"✅ 回调 POST 成功: {callback_url} (paths={len(all_paths)})", flush=True)
+                print(f"✅ 回调 POST 成功: {callback_url.strip()} (paths={len(all_paths)})", flush=True)
             except Exception as e:
                 print(f"⚠️ 回调 POST 失败: {e}", flush=True)
+        elif callback_url and callback_url.strip() and not all_paths:
+            print(f"⚠️ 回调跳过：无有效 OSS paths，未发送 POST", flush=True)
 
         return tuple(results) + (all_success_output, all_urls_str)
 
